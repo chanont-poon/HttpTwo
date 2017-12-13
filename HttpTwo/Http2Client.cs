@@ -9,6 +9,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
 using HttpTwo.Internal;
+using System.Collections;
 
 namespace HttpTwo
 {
@@ -185,6 +186,15 @@ namespace HttpTwo
             };
         }
 
+        /// <summary>
+        /// When sending multiple streams to one device, consecutive and immediate notifications need to be limited to 128.
+        /// Notifications after 128 do not get delivered to the same device.
+        /// </summary>
+        /// <param name="cancelToken"></param>
+        /// <param name="method"></param>
+        /// <param name="headers"></param>
+        /// <param name="requests"></param>
+        /// <returns></returns>
         public async Task<Http2MultiResponse> SendMultipleAsync(
             CancellationToken cancelToken,
             HttpMethod method,
@@ -197,17 +207,40 @@ namespace HttpTwo
 
             var frames = new List<IFrame>();
             var http2Streams = new List<Http2Stream>();
-            var sentEndOfStream = false;
+            var response = new Http2MultiResponse();
 
             foreach (var request in requests)
             {
+                var sentEndOfStream = false;
+
+                var apnsId = headers["apns-id"];
+                if (!string.IsNullOrWhiteSpace(request.ApnsId) &&
+                    headers["apns-id"] == null)
+                {
+                    headers.Add("apns-id", request.ApnsId);
+                    apnsId = request.ApnsId;
+                }
+
                 var http2Stream = await streamManager.Get().ConfigureAwait(false);
                 http2Streams.Add(http2Stream);
+
+                // Initialize response maps
+                response.Responses.Add(
+                    new ApnsResponse
+                    {
+                        ApnsId = apnsId,
+                        Stream = http2Stream
+                    });
+
                 http2Stream.OnFrameReceived += (frame) =>
                 {
                     frames.Add(frame);
+
                     // Check for an end of stream state
-                    if (http2Stream.State == StreamState.HalfClosedRemote || http2Stream.State == StreamState.Closed)
+                    if (frames.Count == requests.Count &&
+                        http2Streams.All(stream =>
+                            stream.State == StreamState.HalfClosedRemote ||
+                            stream.State == StreamState.Closed))
                     {
                         semaphoreClose.Release();
                     }
@@ -239,8 +272,13 @@ namespace HttpTwo
                         .ConfigureAwait(false);
             }
 
-            if (!await semaphoreClose.WaitAsync(ConnectionSettings.ConnectionTimeout, cancelToken).ConfigureAwait(false))
+            if (!await semaphoreClose.WaitAsync(
+                        ConnectionSettings.ConnectionTimeout,
+                        cancelToken)
+                    .ConfigureAwait(false))
+            {
                 throw new TimeoutException();
+            }
 
             var responseData = new List<byte>();
             var rxHeaderData = new List<byte>();
@@ -275,13 +313,40 @@ namespace HttpTwo
 
             var responseHeaders = Util.UnpackHeaders(connection.Decoder, rxHeaderData.ToArray());
 
-            var strStatus = "500";
-            if (responseHeaders[":status"] != null)
-                strStatus = responseHeaders[":status"];
+            MapResponses(responseHeaders, response.Responses);
+            await CleanUp(http2Streams);
 
-            var statusCode = HttpStatusCode.OK;
-            Enum.TryParse<HttpStatusCode>(strStatus, out statusCode);
+            response.Headers = responseHeaders;
+            response.Body = responseData.ToArray();
 
+            return response;
+        }
+
+        private void MapResponses(
+            NameValueCollection responseHeaders,
+            List<ApnsResponse> responses)
+        {
+            var apnsIds =
+                responseHeaders["apns-id"] != null
+                    ? responseHeaders["apns-id"].Split(',').ToList()
+                    : Enumerable.Empty<string>().ToList();
+
+            var statuses =
+                responseHeaders[":status"] != null
+                    ? responseHeaders[":status"].Split(',').ToList()
+                    : Enumerable.Empty<string>().ToList();
+
+            for (var idx = 0; idx < apnsIds.Count; idx++)
+            {
+                var statusCode = HttpStatusCode.OK;
+                Enum.TryParse(statuses[idx], out statusCode);
+
+                responses[idx].Status = statusCode;
+            }
+        }
+
+        private async Task CleanUp(List<Http2Stream> http2Streams)
+        {
             // Remove the stream from being tracked since we're done with it
             foreach (var stream in http2Streams)
             {
@@ -291,14 +356,6 @@ namespace HttpTwo
             // Send a WINDOW_UPDATE frame to release our stream's data count
             // TODO: Eventually need to do this on the stream itself too (if it's open)
             await connection.FreeUpWindowSpace().ConfigureAwait(false);
-
-            return new Http2MultiResponse
-            {
-                Status = statusCode,
-                Streams = http2Streams,
-                Headers = responseHeaders,
-                Body = responseData.ToArray()
-            };
         }
 
         private async Task<bool> QueueHeaders(
@@ -506,14 +563,26 @@ namespace HttpTwo
 
         public class Http2MultiResponse
         {
-            public HttpStatusCode Status { get; set; }
-            public List<Http2Stream> Streams { get; set; }
+            public List<ApnsResponse> Responses { get; set; }
             public NameValueCollection Headers { get; set; }
             public byte[] Body { get; set; }
+
+            public Http2MultiResponse()
+            {
+                this.Responses = new List<ApnsResponse>();
+            }
+        }
+
+        public class ApnsResponse
+        {
+            public string ApnsId { get; set; }
+            public HttpStatusCode Status { get; set; }
+            public Http2Stream Stream { get; set; }
         }
 
         public class Http2Request
         {
+            public string ApnsId { get; set; }
             public Uri Uri { get; set; }
             public Stream DataStream { get; set; }
         }
