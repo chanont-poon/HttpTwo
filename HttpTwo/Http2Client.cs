@@ -213,13 +213,9 @@ namespace HttpTwo
             {
                 var sentEndOfStream = false;
 
-                var apnsId = headers["apns-id"];
-                if (!string.IsNullOrWhiteSpace(request.ApnsId) &&
-                    headers["apns-id"] == null)
-                {
-                    headers.Add("apns-id", request.ApnsId);
-                    apnsId = request.ApnsId;
-                }
+                var apnsId = !string.IsNullOrWhiteSpace(request.ApnsId)
+                    ? request.ApnsId
+                    : Guid.NewGuid().ToString();
 
                 var http2Stream = await streamManager.Get().ConfigureAwait(false);
                 http2Streams.Add(http2Stream);
@@ -229,7 +225,8 @@ namespace HttpTwo
                     new ApnsResponse
                     {
                         ApnsId = apnsId,
-                        Stream = http2Stream
+                        Stream = http2Stream,
+                        Uri = request.Uri
                     });
 
                 http2Stream.OnFrameReceived += (frame) =>
@@ -237,7 +234,9 @@ namespace HttpTwo
                     frames.Add(frame);
 
                     // Check for an end of stream state
-                    if (frames.Count == requests.Count &&
+                    // Data frame with reason is returned when there is any error,
+                    // so need to get only the Headers frames
+                    if (frames.Where(f => f.Type == FrameType.Headers).Count() == requests.Count &&
                         http2Streams.All(stream =>
                             stream.State == StreamState.HalfClosedRemote ||
                             stream.State == StreamState.Closed))
@@ -253,7 +252,8 @@ namespace HttpTwo
                         headers,
                         request.Uri,
                         request.DataStream,
-                        http2Stream);
+                        http2Stream,
+                        apnsId);
 
                 sentEndOfStream =
                     await QueueData(
@@ -338,7 +338,7 @@ namespace HttpTwo
 
             for (var idx = 0; idx < apnsIds.Count; idx++)
             {
-                var statusCode = HttpStatusCode.OK;
+                var statusCode = HttpStatusCode.Accepted;
                 Enum.TryParse(statuses[idx], out statusCode);
 
                 responses[idx].Status = statusCode;
@@ -364,7 +364,8 @@ namespace HttpTwo
             NameValueCollection headers,
             Uri uri,
             Stream dataStream,
-            Http2Stream http2Stream)
+            Http2Stream http2Stream,
+            string apnsId = null)
         {
             var allHeaders = new NameValueCollection
             {
@@ -376,6 +377,11 @@ namespace HttpTwo
 
             if (headers != null && headers.Count > 0)
                 allHeaders.Add(headers);
+
+            if (apnsId != null)
+            {
+                allHeaders.Add("apns-id", apnsId);
+            }
 
             var headerData = Util.PackHeaders(connection.Encoder, allHeaders);
 
@@ -578,6 +584,7 @@ namespace HttpTwo
             public string ApnsId { get; set; }
             public HttpStatusCode Status { get; set; }
             public Http2Stream Stream { get; set; }
+            public Uri Uri { get; set; }
         }
 
         public class Http2Request
