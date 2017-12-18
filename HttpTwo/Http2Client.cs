@@ -186,6 +186,18 @@ namespace HttpTwo
             };
         }
 
+        public async Task<Http2MultiResponse> PostMultipleAsync(
+            NameValueCollection headers,
+            List<Http2Request> requests)
+        {
+            return await this.SendMultipleAsync(
+                new CancellationToken(),
+                HttpMethod.Post,
+                headers,
+                requests)
+                .ConfigureAwait(false);
+        }
+
         /// <summary>
         /// When sending multiple streams to one device, consecutive and immediate notifications need to be limited to 128.
         /// Notifications after 128 do not get delivered to the same device.
