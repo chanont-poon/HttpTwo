@@ -1,4 +1,5 @@
-﻿using System;
+﻿using HttpTwo.Internal;
+using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.IO;
@@ -8,8 +9,6 @@ using System.Net.Http;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
-using HttpTwo.Internal;
-using System.Collections;
 
 namespace HttpTwo
 {
@@ -292,7 +291,7 @@ namespace HttpTwo
                 throw new TimeoutException();
             }
 
-            var responseData = new List<byte>();
+            var responseData = new Dictionary<uint, byte[]>();
             var rxHeaderData = new List<byte>();
 
             foreach (var f in frames)
@@ -313,47 +312,59 @@ namespace HttpTwo
                 }
                 else if (f.Type == FrameType.Data)
                 {
-                    responseData.AddRange((f as DataFrame).Data);
+                    responseData.Add(f.StreamIdentifier, (f as DataFrame).Data);
                 }
                 else if (f.Type == FrameType.GoAway)
                 {
                     var fga = f as GoAwayFrame;
                     if (fga != null && fga.AdditionalDebugData != null && fga.AdditionalDebugData.Length > 0)
-                        responseData.AddRange(fga.AdditionalDebugData);
+                        responseData.Add(f.StreamIdentifier, fga.AdditionalDebugData);
                 }
             }
 
-            var responseHeaders = Util.UnpackHeaders(connection.Decoder, rxHeaderData.ToArray());
+            response.Headers = Util.UnpackHeaders(connection.Decoder, rxHeaderData.ToArray());
 
-            MapResponses(responseHeaders, response.Responses);
+            MapResponses(response, responseData);
             await CleanUp(http2Streams);
-
-            response.Headers = responseHeaders;
-            response.Body = responseData.ToArray();
 
             return response;
         }
 
         private void MapResponses(
-            NameValueCollection responseHeaders,
-            List<ApnsResponse> responses)
+            Http2MultiResponse multipleResponse,
+            Dictionary<uint, byte[]> responseData)
         {
+            var headers = multipleResponse.Headers;
             var apnsIds =
-                responseHeaders["apns-id"] != null
-                    ? responseHeaders["apns-id"].Split(',').ToList()
+                headers["apns-id"] != null
+                    ? headers["apns-id"].Split(',').ToList()
                     : Enumerable.Empty<string>().ToList();
 
             var statuses =
-                responseHeaders[":status"] != null
-                    ? responseHeaders[":status"].Split(',').ToList()
+                headers[":status"] != null
+                    ? headers[":status"].Split(',').ToList()
                     : Enumerable.Empty<string>().ToList();
 
-            for (var idx = 0; idx < apnsIds.Count; idx++)
+            var idx = 0;
+            foreach (var apnsId in apnsIds)
             {
-                var statusCode = HttpStatusCode.Accepted;
-                Enum.TryParse(statuses[idx], out statusCode);
+                var response = multipleResponse.Responses.FirstOrDefault(o => o.ApnsId == apnsId);
 
-                responses[idx].Status = statusCode;
+                if (response != null)
+                {
+                    var statusCode = HttpStatusCode.Accepted;
+                    Enum.TryParse(statuses[idx], out statusCode);
+
+                    response.Status = statusCode;
+
+                    var streamId = response.Stream.StreamIdentifer;
+                    if (responseData.ContainsKey(streamId))
+                    {
+                        response.Body = responseData[streamId];
+                    }
+                }
+
+                idx++;
             }
         }
 
@@ -583,7 +594,6 @@ namespace HttpTwo
         {
             public List<ApnsResponse> Responses { get; set; }
             public NameValueCollection Headers { get; set; }
-            public byte[] Body { get; set; }
 
             public Http2MultiResponse()
             {
@@ -597,6 +607,7 @@ namespace HttpTwo
             public HttpStatusCode Status { get; set; }
             public Http2Stream Stream { get; set; }
             public Uri Uri { get; set; }
+            public byte[] Body { get; set; }
         }
 
         public class Http2Request
